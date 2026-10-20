@@ -43,6 +43,23 @@ static OPUS_MULTISTREAM_CONFIGURATION audioConfig;
 static void* audioBuffer;
 static int audioFrameSize;
 
+// Jitter buffer: playback only starts (or restarts after an underrun) once this much
+// audio is queued, so a late packet is absorbed instead of being heard as a crackle.
+// Costs AUDIO_TARGET_MS of extra audio latency.
+#define AUDIO_TARGET_MS 60
+#define AUDIO_MAX_MS (AUDIO_TARGET_MS + 40)
+static int audioBytesPerMs;
+static BOOL audioPrebuffering;
+
+// Diagnostics: every AUDIO_STATS_INTERVAL_MS a line goes to Documents/audio-stats.log
+// (pull it with `devicectl device copy from --domain-type appDataContainer`).
+#define AUDIO_STATS_INTERVAL_MS 5000
+static FILE* audioStatsFile;
+static Uint32 audioStatsLastTicks;
+static Uint32 audioStatsStartTicks;
+static int audioPlcFrames, audioThresholdDrops, audioUnderruns, audioMinQueuedMs;
+static RTP_AUDIO_STATS audioLastRtpStats;
+
 static VideoDecoderRenderer* renderer;
 
 int DrDecoderSetup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags)
@@ -251,9 +268,24 @@ int ArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, v
         return -1;
     }
     
-    // Start playback
-    SDL_PauseAudioDevice(audioDevice, 0);
-    
+    // Playback starts in ArDecodeAndPlaySample() once the jitter buffer is filled
+    audioBytesPerMs = opusConfig->sampleRate / 1000 * sizeof(short) * opusConfig->channelCount;
+    audioPrebuffering = YES;
+
+    NSString* statsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
+                           stringByAppendingPathComponent:@"audio-stats.log"];
+    audioStatsFile = fopen(statsPath.fileSystemRepresentation, "a");
+    if (audioStatsFile != NULL) {
+        fprintf(audioStatsFile, "# stream start %s | %d Hz, %d ch, %d ms packets, target %d ms\n"
+                "# t_s plc thrDrop underrun minQueuedMs | fecRecovered fecFailed oos invalid\n",
+                [[NSDate date].description UTF8String], opusConfig->sampleRate, opusConfig->channelCount,
+                opusConfig->samplesPerFrame * 1000 / opusConfig->sampleRate, AUDIO_TARGET_MS);
+    }
+    audioStatsStartTicks = audioStatsLastTicks = SDL_GetTicks();
+    audioPlcFrames = audioThresholdDrops = audioUnderruns = 0;
+    audioMinQueuedMs = INT_MAX;
+    memset(&audioLastRtpStats, 0, sizeof(audioLastRtpStats));
+
     // Disable lowering volume of other audio streams (SDL sets AVAudioSessionCategoryOptionDuckOthers by default)
     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
     
@@ -277,32 +309,88 @@ void ArCleanup(void)
         audioBuffer = NULL;
     }
     
+    if (audioStatsFile != NULL) {
+        fclose(audioStatsFile);
+        audioStatsFile = NULL;
+    }
+
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
+}
+
+static void writeAudioStats(void)
+{
+    Uint32 now = SDL_GetTicks();
+    if (audioStatsFile == NULL || now - audioStatsLastTicks < AUDIO_STATS_INTERVAL_MS) {
+        return;
+    }
+
+    const RTP_AUDIO_STATS* rtp = LiGetRTPAudioStats();
+    fprintf(audioStatsFile, "%5u %3d %3d %3d %3d | %3u %3u %3u %3u\n",
+            (now - audioStatsStartTicks) / 1000, audioPlcFrames, audioThresholdDrops, audioUnderruns,
+            audioMinQueuedMs == INT_MAX ? -1 : audioMinQueuedMs,
+            rtp->packetCountFecRecovered - audioLastRtpStats.packetCountFecRecovered,
+            rtp->packetCountFecFailed - audioLastRtpStats.packetCountFecFailed,
+            rtp->packetCountOOS - audioLastRtpStats.packetCountOOS,
+            rtp->packetCountInvalid - audioLastRtpStats.packetCountInvalid);
+    fflush(audioStatsFile);
+
+    audioLastRtpStats = *rtp;
+    audioPlcFrames = audioThresholdDrops = audioUnderruns = 0;
+    audioMinQueuedMs = INT_MAX;
+    audioStatsLastTicks = now;
 }
 
 void ArDecodeAndPlaySample(char* sampleData, int sampleLength)
 {
     int decodeLen;
-    
-    // Don't queue if there's already more than 30 ms of audio data waiting
-    // in Moonlight's audio queue.
-    if (LiGetPendingAudioDuration() > 30) {
+
+    writeAudioStats();
+
+    // Don't queue if there's already a real backlog waiting in Moonlight's audio
+    // queue. Stock uses 30 ms, but on Wi-Fi packets often arrive in bursts that
+    // exceed that, and dropping them is what empties the jitter buffer.
+    if (LiGetPendingAudioDuration() > AUDIO_MAX_MS) {
+        audioThresholdDrops++;
         return;
     }
-    
+
+    // A NULL sample is a packet lost on the network; Opus conceals it (PLC)
+    if (sampleData == NULL) {
+        audioPlcFrames++;
+    }
+
     decodeLen = opus_multistream_decode(opusDecoder, (unsigned char *)sampleData, sampleLength,
                                         (short*)audioBuffer, audioConfig.samplesPerFrame, 0);
     if (decodeLen > 0) {
-        // Provide backpressure on the queue to ensure too many frames don't build up
+        // The queue ran dry: stop and refill the jitter buffer rather than playing
+        // each packet the moment it arrives.
+        if (!audioPrebuffering) {
+            int queuedMs = SDL_GetQueuedAudioSize(audioDevice) / audioBytesPerMs;
+            if (queuedMs < audioMinQueuedMs) {
+                audioMinQueuedMs = queuedMs;
+            }
+            if (SDL_GetQueuedAudioSize(audioDevice) == 0) {
+                SDL_PauseAudioDevice(audioDevice, 1);
+                audioPrebuffering = YES;
+                audioUnderruns++;
+            }
+        }
+
+        // Provide backpressure on the queue to ensure too much audio doesn't build up
         // in SDL's audio queue.
-        while (SDL_GetQueuedAudioSize(audioDevice) / audioFrameSize > 10) {
+        while (SDL_GetQueuedAudioSize(audioDevice) / audioBytesPerMs > AUDIO_MAX_MS) {
             SDL_Delay(1);
         }
-        
+
         if (SDL_QueueAudio(audioDevice,
                            audioBuffer,
                            sizeof(short) * decodeLen * audioConfig.channelCount) < 0) {
             Log(LOG_E, @"Failed to queue audio sample: %s\n", SDL_GetError());
+        }
+
+        if (audioPrebuffering && SDL_GetQueuedAudioSize(audioDevice) / audioBytesPerMs >= AUDIO_TARGET_MS) {
+            SDL_PauseAudioDevice(audioDevice, 0);
+            audioPrebuffering = NO;
         }
     }
 }
