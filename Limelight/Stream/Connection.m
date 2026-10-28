@@ -43,6 +43,21 @@ static OPUS_MULTISTREAM_CONFIGURATION audioConfig;
 static void* audioBuffer;
 static int audioFrameSize;
 
+// Adaptive jitter buffer. Audio normally starts playing the moment it arrives, which
+// is the lowest latency possible. On links that deliver packets in bursts (typically
+// Wi-Fi) the SDL queue runs dry between bursts and every underrun is an audible
+// crackle. After an underrun we hold playback until a small cushion is queued,
+// growing it while underruns keep happening and giving the latency back once the
+// stream has been clean for a while. A stream that never underruns is unaffected.
+#define AUDIO_JITTER_STEP_MS 20
+#define AUDIO_JITTER_MAX_MS 60
+#define AUDIO_JITTER_DECAY_MS 30000
+static int audioBytesPerMs;
+static int audioFrameMs;
+static int audioJitterMs;
+static BOOL audioBuffering;
+static Uint32 audioJitterChangeTicks;
+
 static VideoDecoderRenderer* renderer;
 
 int DrDecoderSetup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags)
@@ -251,9 +266,13 @@ int ArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, v
         return -1;
     }
     
-    // Start playback
-    SDL_PauseAudioDevice(audioDevice, 0);
-    
+    // Playback starts with the first decoded sample (see ArDecodeAndPlaySample)
+    audioBytesPerMs = opusConfig->sampleRate / 1000 * sizeof(short) * opusConfig->channelCount;
+    audioFrameMs = opusConfig->samplesPerFrame * 1000 / opusConfig->sampleRate;
+    audioJitterMs = 0;
+    audioBuffering = YES;
+    audioJitterChangeTicks = SDL_GetTicks();
+
     // Disable lowering volume of other audio streams (SDL sets AVAudioSessionCategoryOptionDuckOthers by default)
     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
     
@@ -285,24 +304,49 @@ void ArDecodeAndPlaySample(char* sampleData, int sampleLength)
     int decodeLen;
     
     // Don't queue if there's already more than 30 ms of audio data waiting
-    // in Moonlight's audio queue.
-    if (LiGetPendingAudioDuration() > 30) {
+    // in Moonlight's audio queue, on top of whatever jitter cushion we keep.
+    if (LiGetPendingAudioDuration() > 30 + audioJitterMs) {
         return;
     }
-    
+
     decodeLen = opus_multistream_decode(opusDecoder, (unsigned char *)sampleData, sampleLength,
                                         (short*)audioBuffer, audioConfig.samplesPerFrame, 0);
     if (decodeLen > 0) {
+        Uint32 now = SDL_GetTicks();
+
+        if (!audioBuffering && SDL_GetQueuedAudioSize(audioDevice) == 0) {
+            // The queue ran dry, so the last gap was heard. Hold playback until a
+            // cushion builds up instead of playing each packet as it arrives.
+            if (audioJitterMs < AUDIO_JITTER_MAX_MS) {
+                audioJitterMs += AUDIO_JITTER_STEP_MS;
+                Log(LOG_I, @"Audio underrun: jitter buffer raised to %d ms\n", audioJitterMs);
+            }
+            SDL_PauseAudioDevice(audioDevice, 1);
+            audioBuffering = YES;
+            audioJitterChangeTicks = now;
+        }
+        else if (audioJitterMs > 0 && SDL_TICKS_PASSED(now, audioJitterChangeTicks + AUDIO_JITTER_DECAY_MS)) {
+            // No underruns for a while: give some of the latency back
+            audioJitterMs -= AUDIO_JITTER_STEP_MS;
+            audioJitterChangeTicks = now;
+            Log(LOG_I, @"Audio stable: jitter buffer lowered to %d ms\n", audioJitterMs);
+        }
+
         // Provide backpressure on the queue to ensure too many frames don't build up
         // in SDL's audio queue.
-        while (SDL_GetQueuedAudioSize(audioDevice) / audioFrameSize > 10) {
+        while (SDL_GetQueuedAudioSize(audioDevice) / audioBytesPerMs > SDL_max(10 * audioFrameMs, audioJitterMs + 40)) {
             SDL_Delay(1);
         }
-        
+
         if (SDL_QueueAudio(audioDevice,
                            audioBuffer,
                            sizeof(short) * decodeLen * audioConfig.channelCount) < 0) {
             Log(LOG_E, @"Failed to queue audio sample: %s\n", SDL_GetError());
+        }
+
+        if (audioBuffering && SDL_GetQueuedAudioSize(audioDevice) / audioBytesPerMs >= audioJitterMs) {
+            SDL_PauseAudioDevice(audioDevice, 0);
+            audioBuffering = NO;
         }
     }
 }
